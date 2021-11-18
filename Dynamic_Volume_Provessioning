@@ -1,0 +1,205 @@
+# OpenShift 4.x Azure File Dynamic Provisioning.
+
+The StorageClass resource object describes and classifies storage that can be requested, as well as provides a means for passing parameters for dynamically provisioned storage on demand. StorageClass objects can also serve as a management mechanism for controlling different levels of storage and access to the storage. 
+
+Cluster Administrators (cluster-admin) or Storage Administrators (storage-admin) define and create the StorageClass objects that users can request without needing any detailed knowledge about the underlying storage volume sources.
+
+The OpenShift Container Platform persistent volume framework enables this functionality and allows administrators to provision a cluster with persistent storage. The framework also gives users a way to request those resources without having any knowledge of the underlying infrastructure.
+
+
+## Available dynamic provisioning plug-ins
+
+| Storage type | Provisioner plug-in name | Notes |
+|------|:--------------|:--------|
+|Red Hat OpenStack Platform (RHOSP) Cinder | kubernetes.io/cinder |   |
+|RHOSP Manila Container Storage Interface (CSI) | manila.csi.openstack.org | Once installed, the OpenStack Manila CSI Driver Operator and ManilaDriver automatically create the required storage classes for all available Manila share types needed for dynamic provisioning. |
+|AWS Elastic Block Store (EBS) | kubernetes.io/aws-ebs | For dynamic provisioning when using multiple clusters in different zones, tag each node with Key=kubernetes.io/cluster/<cluster_name>,Value=<cluster_id> where <cluster_name> and <cluster_id> are unique per cluster.  |
+|AWS Elastic File System (EFS) | | Dynamic provisioning is accomplished through the EFS provisioner Pod and not through a provisioner plug-in.|
+|Azure Disk | kubernetes.io/azure-disk | |
+|Azure File | kubernetes.io/azure-file | The persistent-volume-binder service account requires permissions to create and get secrets to store the Azure storage account and keys.|
+|GCE Persistent Disk (gcePD) | kubernetes.io/gce-pd | In multi-zone configurations, it is advisable to run one OpenShift Container Platform cluster per GCE project to avoid PVs from being created in zones where no node in the current cluster exists. |
+|VMware vSphere | kubernetes.io/vsphere-volume | |
+
+## Defining a storage class
+StorageClass objects are currently a globally scoped object and must be created by cluster-admin or storage-admin users.
+
+
+## Azure Disk object definition
+
+azure-advanced-disk-storageclass.yaml
+```
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: managed-premium
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: kubernetes.io/azure-disk
+volumeBindingMode: WaitForFirstConsumer 
+allowVolumeExpansion: true
+parameters:
+  kind: Managed 
+  storageaccounttype: Premium_LRS 
+reclaimPolicy: Delete 
+```
+
+## Azure File object definition
+The Azure File storage class uses secrets to store the Azure storage account name and the storage account key that are required to create an Azure Files share. These permissions are created as part of the following procedure.
+
+## Procedure
+
+#### 1. Define a ClusterRole object that allows access to create and view secrets:  ( azure-file-role.yaml )
+```
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: azure-persistent-volume-binder-role
+rules:
+- apiGroups: ['']
+  resources: ['secrets']
+  verbs:     ['get','create']
+```
+
+
+
+#### 2. Add the cluster role to the service account:  ( azure-persistent-volume-binder-role-binding.yaml )
+```
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  creationTimestamp: null
+  name: azure-persistent-volume-binder-role
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: azure-persistent-volume-binder-role
+subjects:
+- kind: ServiceAccount
+  name: persistent-volume-binder
+  namespace: kube-system
+```
+
+
+
+#### 3. Create a storage account on azure for fileshare & add the creds. in openshift.  
+```
+oc create secret generic azure-file-share-test --from-literal=azurestorageaccountname="<<storageAccount>>"  --from-literal=azurestorageaccountkey="<<>storageAccountkey>"
+```
+
+
+
+#### 4. Create the Azure File StorageClass object:  ( azure-file-storage-class.yaml )
+```
+kind: StorageClass
+apiVersion: storage.k8s.io/v1
+allowVolumeExpansion: true
+metadata:
+  name: azure-file
+provisioner: kubernetes.io/azure-file
+parameters:
+  location: West Europe
+  skuName: Standard_LRS
+  storageAccount: <<storage-account>>
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+```
+```
+$ oc get sc | grep -i azure-file
+azure-file                  kubernetes.io/azure-file   Retain          Immediate              true                   38h
+$
+
+```
+
+
+
+#### 5. Let's create a sample claim in order to test the functionality.  ( sample-pvc.yaml )
+```
+apiVersion: "v1"
+kind: "PersistentVolumeClaim"
+metadata:
+  name: "sampleclaim"
+spec:
+  accessModes:
+    - "ReadWriteMany"
+  resources:
+    requests:
+      storage: "5Gi"
+  storageClassName: azure-file
+
+```
+
+```
+$ oc apply -f sample-pvc.yaml
+persistentvolumeclaim/sampleclaim created
+$
+```
+
+```
+$ oc get pvc
+NAME          STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+sampleclaim   Bound    pvc-9db9f234-1a8c-4b65-bac5-749956941a5f   5Gi        RWX            azure-file     94s
+$
+
+```
+
+
+
+
+#### 6. Let's deploy sample busybox replication cantroler with newly create PVC ( PersistentVolumeClaim ).  ( busybox.yaml )
+```
+# This mounts the nfs volume claim into /mnt and continuously
+# overwrites /mnt/index.html with the time and hostname of the pod.
+
+apiVersion: v1
+kind: ReplicationController
+metadata:
+  name: sample-web-app
+spec:
+  replicas: 3
+  selector:
+    name: sample-web-app
+  template:
+    metadata:
+      labels:
+        name: sample-web-app
+    spec:
+      containers:
+      - image: busybox
+        command:
+          - sh
+          - -c
+          - 'while true; do date >> /mnt/index.html; hostname >> /mnt/index.html; echo "Amit Vashist" >> /mnt/index.html; sleep $(($RANDOM % 5 + 5)); done'
+        imagePullPolicy: IfNotPresent
+        name: busybox
+        volumeMounts:
+          # name must match the volume name below
+          - name: nfs
+            mountPath: "/mnt"
+      volumes:
+      - name: nfs
+        persistentVolumeClaim:
+          claimName: sampleclaim
+```
+
+```
+$ oc apply -f busybox.yaml
+replicationcontroller/sample-web-app created
+$
+```
+
+```
+$ oc get pods | grep -i sample-web-app
+sample-web-app-96njs   1/1     Running   0          89s
+sample-web-app-mqtnd   1/1     Running   0          89s
+sample-web-app-nh62r   1/1     Running   0          89s
+$
+```
+
+#### 7. Now we can download the IndexPage Genrated by the sample app form the Storage Account @ Azure Portal. 
+
+#### 8. Clean up ( SampleApp & PVC )
+```
+$ oc delete -f busybox.yaml
+$ oc delete -f sample-pvc.yaml
+```
+
